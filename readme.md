@@ -1,6 +1,13 @@
-# AI education enviroment.
+# AIotate — AI-powered educational worksheet generator
 
-Artifically inteligent Education Enviroment.
+**AIotate** is an open-source platform for creating question papers and LaTeX documents using AI. It combines a Go backend, a React + Vite frontend, and AI services to generate, validate, and export high-quality educational worksheets and notebooks.
+
+## What it does
+- Generate educational worksheets (sheets) from prompts using AI (Gemini) and return compilable LaTeX output
+- Organize content into notebooks (subject-based collections of sheets) with metadata and tags
+- Queue and process generation requests (FIFO) with retry and validation logic
+- Validate LaTeX output (tectonic) and export compiled assets to storage/bucket
+- Provide a web UI for creating, reviewing and exporting generated materials
 
 
 Strucutre

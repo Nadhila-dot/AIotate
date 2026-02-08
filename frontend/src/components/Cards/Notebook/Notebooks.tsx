@@ -268,18 +268,18 @@ export default function NotebookListCard() {
             <div className="text-lg font-medium text-gray-700">Loading notebooks...</div>
           </div>
         ) : notebooks.length === 0 ? (
-            <div className="flex flex-col lg:mt-20 items-center justify-center p-8 text-center">
-              <img
-                src="/undraw/empty.svg"
-                alt="No notebooks"
-                className="mb-4 rounded-lg shadow"
-                width={320}
-                height={320}
-              />
-              <div className="text-2xl font-medium text-gray-600">
-                No notebooks found. Create your first notebook to get started!
-              </div>
-            </div>
+          <div className="flex flex-col items-center justify-center py-12">
+            <img 
+              src="/undraw/empty.svg" 
+              alt="No notebooks" 
+              className="w-64 h-64 mb-6 opacity-80"
+            />
+            <h2 className="text-2xl font-bold text-gray-800 mb-2">No Notebooks Found</h2>
+            <p className="text-base text-gray-600 text-center max-w-md mb-4">
+              You haven't created any notebooks yet. Notebooks help you organize your sheets by subject or topic.
+            </p>
+            <CreateNotebook onCreated={mutateData} />
+          </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
             {notebooks.map((nb, idx) => (

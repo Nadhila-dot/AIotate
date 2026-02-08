@@ -1,75 +1,74 @@
 package main
 
 import (
-    "embed"
-    "io/fs"
-    "os"
-    "path/filepath"
+	"io/fs"
+	"log"
+	"os"
+	"path/filepath"
 
-    "nadhi.dev/sarvar/fun/bootstrap"
-    _"nadhi.dev/sarvar/fun/config"
-    logg "nadhi.dev/sarvar/fun/logs"
+	"nadhi.dev/sarvar/fun/bootstrap"
+	_ "nadhi.dev/sarvar/fun/config"
+	embeddedAssets "nadhi.dev/sarvar/fun/embed"
 )
 
-// Do not remove
-// Embedding all files in web/dist and zp-inject directories 
-
-
-//go:embed web/dist/* zp-inject/*
-var embeddedFiles embed.FS
-
+// ExtractedAssetsPath stores where assets were extracted
 var ExtractedAssetsPath string
 
 func init() {
-    // Create a temporary directory for extracted assets
-    tempDir, err := os.MkdirTemp("", "vela-assets-*")
-    if err != nil {
-        logg.Error("Failed to create temp directory for assets")
-        panic(err)
-    }
-    ExtractedAssetsPath = tempDir
-    logg.Info("Assets will be extracted to: " + ExtractedAssetsPath)
+	// Get executable directory
+	exePath, err := os.Executable()
+	if err != nil {
+		log.Fatal("Failed to get executable path:", err)
+	}
+	exeDir := filepath.Dir(exePath)
 
-    // Extract embedded files to temp directory
-    err = fs.WalkDir(embeddedFiles, ".", func(path string, d fs.DirEntry, err error) error {
-        if err != nil {
-            return err
-        }
-        if d.IsDir() {
-            return nil
-        }
+	// Create web directory next to executable
+	webDir := filepath.Join(exeDir, "web")
+	ExtractedAssetsPath = webDir
 
-        // Read file from embedded FS
-        data, err := fs.ReadFile(embeddedFiles, path)
-        if err != nil {
-            return err
-        }
+	log.Printf("[ASSETS] Extracting embedded assets to: %s", webDir)
 
-        // Create destination path
-        destPath := filepath.Join(ExtractedAssetsPath, path)
-        destDir := filepath.Dir(destPath)
+	// Extract embedded dist to web/dist
+	distDir := filepath.Join(webDir, "dist")
+	if err := os.MkdirAll(distDir, 0755); err != nil {
+		log.Fatal("Failed to create web/dist directory:", err)
+	}
 
-        // Create directories if needed
-        if err := os.MkdirAll(destDir, 0755); err != nil {
-            return err
-        }
+	// Walk through embedded files and extract
+	err = fs.WalkDir(embeddedAssets.DistFS, "dist", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
 
-        // Write file to disk
-        if err := os.WriteFile(destPath, data, 0644); err != nil {
-            return err
-        }
+		// Skip the root "dist" directory itself
+		if path == "dist" {
+			return nil
+		}
 
-        return nil
-    })
+		// Get relative path (remove "dist/" prefix)
+		relPath := path[5:] // Remove "dist/"
+		targetPath := filepath.Join(distDir, relPath)
 
-    if err != nil {
-        logg.Error("Failed to extract embedded assets")
-        panic(err)
-    }
+		if d.IsDir() {
+			return os.MkdirAll(targetPath, 0755)
+		}
 
-    logg.Success("Embedded assets extracted successfully")
+		// Read embedded file
+		data, err := fs.ReadFile(embeddedAssets.DistFS, path)
+		if err != nil {
+			return err
+		}
 
-    // Call bootstrap package to initialize the application
-    // This will make all the directort
-    bootstrap.Initialize()
+		// Write to disk
+		return os.WriteFile(targetPath, data, 0644)
+	})
+
+	if err != nil {
+		log.Fatal("Failed to extract embedded assets:", err)
+	}
+
+	log.Println("[ASSETS] ✓ Assets extracted successfully")
+
+	// Call bootstrap to initialize application
+	bootstrap.Initialize()
 }

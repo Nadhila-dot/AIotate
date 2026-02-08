@@ -2,25 +2,36 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
-	"path/filepath"
 )
 
-func MakeJsonConfig(api_key string, source string, model string) error {
-    config := map[string]interface{}{
-        "AI_API": api_key,
-        "MAX_SESSIONS":     2,
-        "SHEET_QUEUE_DIR":  "./storage/queue_data",
-    }
-    return SaveConfig(config)
-}
+var (
+	ErrAPIKeyNotSet  = errors.New("AI_API key is not set in configuration")
+	ErrInvalidConfig = errors.New("invalid configuration format")
+)
 
+// SaveConfig saves the configuration to set.json
 func SaveConfig(config map[string]interface{}) error {
-	rootDir := filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(os.Args[0]))))
-	configPath := filepath.Join(rootDir, "set.json")
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(configPath, data, 0644)
+	return os.WriteFile(ConfigPath, data, 0644)
+}
+
+// UpdateConfigValue updates a specific configuration value
+func UpdateConfigValue(key string, value interface{}) error {
+	config, err := GetConfig()
+	if err != nil {
+		return err
+	}
+
+	config[key] = value
+	return SaveConfig(config)
+}
+
+// SetAPIKey sets the AI API key in the configuration
+func SetAPIKey(apiKey string) error {
+	return UpdateConfigValue("AI_API", apiKey)
 }

@@ -1,19 +1,26 @@
 package api
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"mime"
+	"mime/multipart"
+	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/thrasher-corp/gocryptotrader/config"
+	"github.com/google/uuid"
 	"nadhi.dev/sarvar/fun/ai"
 	"nadhi.dev/sarvar/fun/auth"
 	vela "nadhi.dev/sarvar/fun/bucket"
-	"nadhi.dev/sarvar/fun/config"
+	"nadhi.dev/sarvar/fun/pipeline"
 	"nadhi.dev/sarvar/fun/server"
 	sheet "nadhi.dev/sarvar/fun/sheets"
 )
@@ -27,23 +34,135 @@ type Sheet struct {
 	Visibility  string   `json:"visibility"`
 }
 
+const maxUploadBytes = 20 * 1024 * 1024
+
+func parseCreateSheetMultipart(c *fiber.Ctx, req *struct {
+	Subject             string          `json:"subject"`
+	Course              string          `json:"course"`
+	Description         string          `json:"description"`
+	Tags                string          `json:"tags"`
+	Curriculum          string          `json:"curriculum"`
+	SpecialInstructions string          `json:"specialInstructions"`
+	Visibility          string          `json:"visibility"`
+	StyleName           string          `json:"styleName"`
+	Mode                string          `json:"mode"`
+	WebSearchQuery      string          `json:"webSearchQuery"`
+	WebSearchEnabled    bool            `json:"webSearchEnabled"`
+	Attachments         []ai.Attachment `json:"attachments"`
+}) error {
+	form, err := c.MultipartForm()
+	if err != nil {
+		return fmt.Errorf("invalid multipart form")
+	}
+
+	getValue := func(key string) string {
+		if vals, ok := form.Value[key]; ok && len(vals) > 0 {
+			return vals[0]
+		}
+		return ""
+	}
+
+	req.Subject = getValue("subject")
+	req.Course = getValue("course")
+	req.Description = getValue("description")
+	req.Tags = getValue("tags")
+	req.Curriculum = getValue("curriculum")
+	req.SpecialInstructions = getValue("specialInstructions")
+	req.Visibility = getValue("visibility")
+	req.StyleName = getValue("styleName")
+	req.Mode = getValue("mode")
+	req.WebSearchQuery = getValue("webSearchQuery")
+	req.WebSearchEnabled = strings.ToLower(getValue("webSearchEnabled")) == "true"
+
+	files := []*multipart.FileHeader{}
+	if fileList, ok := form.File["files"]; ok {
+		files = append(files, fileList...)
+	}
+	if fileList, ok := form.File["attachments"]; ok {
+		files = append(files, fileList...)
+	}
+
+	if len(files) == 0 {
+		return nil
+	}
+
+	var total int64
+	for _, fh := range files {
+		total += fh.Size
+	}
+	if total > maxUploadBytes {
+		return fmt.Errorf("upload exceeds 20MB limit")
+	}
+
+	attachments, err := parseAttachments(files)
+	if err != nil {
+		return err
+	}
+	req.Attachments = attachments
+
+	return nil
+}
+
+func parseAttachments(files []*multipart.FileHeader) ([]ai.Attachment, error) {
+	attachments := make([]ai.Attachment, 0, len(files))
+	for _, fh := range files {
+		file, err := fh.Open()
+		if err != nil {
+			return nil, fmt.Errorf("failed to open file: %s", fh.Filename)
+		}
+		data, err := io.ReadAll(file)
+		file.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read file: %s", fh.Filename)
+		}
+
+		mimeType := fh.Header.Get("Content-Type")
+		if mimeType == "" {
+			mimeType = http.DetectContentType(data)
+		}
+		if ext := strings.TrimSpace(fh.Filename); ext != "" {
+			if m := mime.TypeByExtension("." + strings.Split(ext, ".")[len(strings.Split(ext, "."))-1]); m != "" {
+				mimeType = m
+			}
+		}
+
+		content := ""
+		encoding := "base64"
+		if utf8.Valid(data) {
+			content = string(data)
+			encoding = "utf-8"
+		} else {
+			content = base64.StdEncoding.EncodeToString(data)
+		}
+
+		attachments = append(attachments, ai.Attachment{
+			Name:     fh.Filename,
+			MimeType: mimeType,
+			Size:     fh.Size,
+			Content:  content,
+			Encoding: encoding,
+		})
+	}
+
+	return attachments, nil
+}
+
 // Last request timestamps for cooldown
 var lastRequestTimes = make(map[string]time.Time)
 
-// sheetGen is the global sheet generator instance
-var sheetGen *sheet.SheetGenerator
-
 // SheetsIndex registers all sheet related routes
 func SheetsIndex() error {
-	// Initialize GlobalSheetGenerator if it's nil
-	if sheet.GlobalSheetGenerator == nil {
-		var err error
-		sheet.GlobalSheetGenerator, err = sheet.NewSheetGenerator(nil, "./queue_data", 2)
-		if err != nil {
-			log.Printf("Failed to initialize GlobalSheetGenerator: %v", err)
-			return err
+	if sheet.GlobalPipelineQueue == nil || sheet.GlobalPipelineStore == nil {
+		log.Printf("Warning: Pipeline not initialized; falling back to legacy queue")
+		if sheet.GlobalSheetGenerator == nil {
+			var err error
+			sheet.GlobalSheetGenerator, err = sheet.NewSheetGenerator(nil, "./queue_data", 2)
+			if err != nil {
+				log.Printf("Failed to initialize GlobalSheetGenerator: %v", err)
+				return err
+			}
+			log.Printf("GlobalSheetGenerator initialized successfully")
 		}
-		log.Printf("GlobalSheetGenerator initialized successfully")
 	}
 
 	server.Route.Post("/api/v1/sheets/generate-tags", generateTags)
@@ -51,107 +170,169 @@ func SheetsIndex() error {
 	server.Route.Post("/api/v1/sheets/generate-course", generateCourse)
 	server.Route.Post("/api/v1/sheets/generate-description", generateDescription)
 	server.Route.Post("/api/v1/sheets/queue/:id", func(c *fiber.Ctx) error {
-    id := c.Params("id")
-    if id == "" {
-        return c.Status(400).JSON(fiber.Map{"error": "missing job id"})
-    }
-    if sheet.GlobalSheetGenerator == nil || sheet.GlobalSheetGenerator.Queue == nil {
-        return c.Status(500).JSON(fiber.Map{"error": "Sheet queue not initialized"})
-    }
-    err := sheet.GlobalSheetGenerator.Queue.DeleteJob(id)
-    if err != nil {
-        return c.Status(500).JSON(fiber.Map{"error": err.Error()})
-    }
-    return c.JSON(fiber.Map{"status": "deleted"})
-})
+		id := c.Params("id")
+		if id == "" {
+			return c.Status(400).JSON(fiber.Map{"error": "missing job id"})
+		}
 
+		if sheet.GlobalPipelineStore != nil {
+			if jobID, err := parsePipelineJobID(id); err == nil {
+				if err := sheet.GlobalPipelineStore.DeleteJob(jobID); err == nil {
+					return c.JSON(fiber.Map{"status": "deleted"})
+				}
+			}
+		}
+
+		if sheet.GlobalSheetGenerator == nil || sheet.GlobalSheetGenerator.Queue == nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Sheet queue not initialized"})
+		}
+		err := sheet.GlobalSheetGenerator.Queue.DeleteJob(id)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		}
+		return c.JSON(fiber.Map{"status": "deleted"})
+	})
 
 	server.Route.Get("/api/v1/sheets/get", func(c *fiber.Ctx) error {
-    // Query params
-    search := c.Query("search", "")
-    latest := c.Query("latest", "true") == "true"
-    objNumStr := c.Query("obj_num", "10")
-    objNum, err := strconv.Atoi(objNumStr)
-    if err != nil || objNum <= 0 {
-        objNum = 10
-    }
+		// Query params
+		search := c.Query("search", "")
+		latest := c.Query("latest", "true") == "true"
+		objNumStr := c.Query("obj_num", "10")
+		objNum, err := strconv.Atoi(objNumStr)
+		if err != nil || objNum <= 0 {
+			objNum = 10
+		}
 
-    queuePath := "./queue_data/queue.json"
-    items, err := vela.GetQueueItems(queuePath, latest, objNum, search)
-    if err != nil {
-        return c.Status(500).JSON(fiber.Map{"error": "Failed to get queue items"})
-    }
-    return c.JSON(items)
-})
+		if sheet.GlobalPipelineStore != nil {
+			items, err := getPipelineQueueItems(search, latest, objNum)
+			if err == nil {
+				return c.JSON(items)
+			}
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to read pipeline jobs"})
+		}
 
-	
-server.Route.Post("/api/v1/sheets/create", func(c *fiber.Ctx) error {
-    var req struct {
-        Subject             string `json:"subject"`
-        Course              string `json:"course"`
-        Description         string `json:"description"`
-        Tags                string `json:"tags"`
-        Curriculum          string `json:"curriculum"`
-        SpecialInstructions string `json:"specialInstructions"`
-        Visibility          string `json:"visibility"`
-    }
-    if err := c.BodyParser(&req); err != nil {
-        return c.Status(400).JSON(fiber.Map{"error": "Invalid request"})
-    }
+		queuePath := "./queue_data/queue.json"
+		items, err := vela.GetQueueItems(queuePath, latest, objNum, search)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to get queue items"})
+		}
+		return c.JSON(items)
+	})
 
-    // Validate required fields
-    if req.Subject == "" || req.Course == "" || req.Description == "" || req.Tags == "" || req.Curriculum == "" || req.SpecialInstructions == "" || req.Visibility == "" {
-        return c.Status(400).JSON(fiber.Map{"error": "Invalid request: missing required fields"})
-    }
+	server.Route.Post("/api/v1/sheets/create", func(c *fiber.Ctx) error {
+		var req struct {
+			Subject             string          `json:"subject"`
+			Course              string          `json:"course"`
+			Description         string          `json:"description"`
+			Tags                string          `json:"tags"`
+			Curriculum          string          `json:"curriculum"`
+			SpecialInstructions string          `json:"specialInstructions"`
+			Visibility          string          `json:"visibility"`
+			StyleName           string          `json:"styleName"`
+			Mode                string          `json:"mode"`
+			WebSearchQuery      string          `json:"webSearchQuery"`
+			WebSearchEnabled    bool            `json:"webSearchEnabled"`
+			Attachments         []ai.Attachment `json:"attachments"`
+		}
+		contentType := c.Get("Content-Type")
+		if strings.HasPrefix(contentType, "multipart/form-data") {
+			if err := parseCreateSheetMultipart(c, &req); err != nil {
+				return c.Status(400).JSON(fiber.Map{"error": err.Error()})
+			}
+		} else {
+			if err := c.BodyParser(&req); err != nil {
+				return c.Status(400).JSON(fiber.Map{"error": "Invalid request"})
+			}
+		}
 
-    // Extract and validate session
-    authHeader := c.Get("Authorization")
-    if len(authHeader) < 8 || !strings.HasPrefix(authHeader, "Bearer ") {
-        return c.Status(401).JSON(fiber.Map{"error": "missing or invalid authorization header"})
-    }
-    sessionID := authHeader[7:]
-    valid, err := auth.IsSessionValid(sessionID)
-    if err != nil || !valid {
-        return c.Status(401).JSON(fiber.Map{"error": "invalid session"})
-    }
+		// Validate required fields
+		if req.Subject == "" || req.Course == "" || req.Description == "" || req.Tags == "" || req.Curriculum == "" || req.SpecialInstructions == "" || req.Visibility == "" {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid request: missing required fields"})
+		}
 
-    // Get user from session
-    user, err := auth.GetUserBySession(sessionID)
-    if err != nil {
-        return c.Status(401).JSON(fiber.Map{"error": "user not found or session invalid"})
-    }
-    userID := user.Username
+		// Extract and validate session
+		authHeader := c.Get("Authorization")
+		if len(authHeader) < 8 || !strings.HasPrefix(authHeader, "Bearer ") {
+			return c.Status(401).JSON(fiber.Map{"error": "missing or invalid authorization header"})
+		}
+		sessionID := authHeader[7:]
+		valid, err := auth.IsSessionValid(sessionID)
+		if err != nil || !valid {
+			return c.Status(401).JSON(fiber.Map{"error": "invalid session"})
+		}
 
-    // Create a proper GenerationRequest
-    genRequest := &ai.GenerationRequest{
-        Subject:             req.Subject,
-        Course:              req.Course,
-        Description:         req.Description,
-        Tags:                strings.Split(req.Tags, ","), // Convert comma-separated string to slice
-        Curriculum:          req.Curriculum,
-        SpecialInstructions: req.SpecialInstructions,
-    }
+		// Get user from session
+		user, err := auth.GetUserBySession(sessionID)
+		if err != nil {
+			return c.Status(401).JSON(fiber.Map{"error": "user not found or session invalid"})
+		}
+		userID := user.Username
 
-    // Double-check GlobalSheetGenerator is not nil
-    if sheet.GlobalSheetGenerator == nil {
-        return c.Status(500).JSON(fiber.Map{"error": "Sheet generator not initialized"})
-    }
+		// Create a proper GenerationRequest
+		genRequest := &ai.GenerationRequest{
+			Subject:             req.Subject,
+			Course:              req.Course,
+			Description:         req.Description,
+			Tags:                strings.Split(req.Tags, ","), // Convert comma-separated string to slice
+			Curriculum:          req.Curriculum,
+			SpecialInstructions: req.SpecialInstructions,
+			StyleName:           req.StyleName,
+			Username:            userID,
+			Mode:                req.Mode,
+			WebSearchQuery:      req.WebSearchQuery,
+			WebSearchEnabled:    req.WebSearchEnabled,
+			Attachments:         req.Attachments,
+		}
 
-    jobID, err := sheet.GlobalSheetGenerator.CreateSheet(userID, genRequest)
-    if err != nil {
-        return c.Status(500).JSON(fiber.Map{"error": "Failed to enqueue sheet"})
-    }
+		requestJSON, err := json.Marshal(genRequest)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to build request"})
+		}
 
-    return c.JSON(fiber.Map{"jobId": jobID, "status": "queued"})
-})
+		if sheet.GlobalPipelineStore != nil && sheet.GlobalPipelineQueue != nil {
+			job := pipeline.NewJob(userID, string(requestJSON), 3)
+			job.Metadata["request"] = genRequest
+			if err := sheet.GlobalPipelineStore.SaveJob(job); err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": "Failed to save job"})
+			}
+			conv := pipeline.NewConversation(job.ID)
+			_ = sheet.GlobalPipelineStore.SaveConversation(conv)
+			if err := sheet.GlobalPipelineQueue.Enqueue(job.ID); err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": "Failed to enqueue sheet"})
+			}
+			return c.JSON(fiber.Map{"jobId": job.ID.String(), "status": "queued"})
+		}
 
+		// Fallback to legacy queue
+		if sheet.GlobalSheetGenerator == nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Sheet generator not initialized"})
+		}
+
+		jobID, err := sheet.GlobalSheetGenerator.CreateSheet(userID, genRequest)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to enqueue sheet"})
+		}
+
+		return c.JSON(fiber.Map{"jobId": jobID, "status": "queued"})
+	})
 
 	server.Route.Get("/api/v1/sheets/queue", func(c *fiber.Ctx) error {
 		userID := c.Locals("username")
 		if userID == nil {
 			userID = "anonymous"
 		}
-		jobs, err := sheetGen.GetUserJobs(userID.(string))
+
+		if sheet.GlobalPipelineStore != nil {
+			jobs, err := sheet.GlobalPipelineStore.GetJobsByUser(userID.(string))
+			if err == nil {
+				return c.JSON(jobs)
+			}
+		}
+
+		if sheet.GlobalSheetGenerator == nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Sheet generator not initialized"})
+		}
+		jobs, err := sheet.GlobalSheetGenerator.GetUserJobs(userID.(string))
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Failed to get queue"})
 		}
@@ -161,20 +342,78 @@ server.Route.Post("/api/v1/sheets/create", func(c *fiber.Ctx) error {
 	return nil
 }
 
-// getGeminiKey retrieves the Gemini API key
-func getGeminiKey() string {
-	value3 := config.GetConfigValue("AI_API")
-	if value3 != nil {
-		if key, ok := value3.(string); ok && key != "" {
-			return key
-		}
-	}
-	return ""
+func parsePipelineJobID(id string) (uuid.UUID, error) {
+	return uuid.Parse(id)
 }
 
-// getGeminiModel returns the model to use
-func getGeminiModel() string {
-	return "gemini-2.5-flash-lite"
+func mapPipelineStatus(status pipeline.JobStatus) string {
+	switch status {
+	case pipeline.StatusCompleted:
+		return "completed"
+	case pipeline.StatusError, pipeline.StatusAborted:
+		return "error"
+	case pipeline.StatusRunning, pipeline.StatusPending, pipeline.StatusWaitingManual, pipeline.StatusWaitingAIFix:
+		return "processing"
+	default:
+		return "processing"
+	}
+}
+
+func getPipelineQueueItems(search string, latest bool, limit int) ([]map[string]interface{}, error) {
+	jobs, err := sheet.GlobalPipelineStore.GetAllJobs()
+	if err != nil {
+		return nil, err
+	}
+
+	searchLower := strings.ToLower(strings.TrimSpace(search))
+	items := make([]map[string]interface{}, 0, len(jobs))
+
+	for _, job := range jobs {
+		if searchLower != "" && !strings.Contains(strings.ToLower(job.Prompt), searchLower) {
+			continue
+		}
+
+		result := interface{}(nil)
+		if job.Status == pipeline.StatusCompleted {
+			metadata := map[string]interface{}{}
+			if job.Metadata != nil {
+				if md, ok := job.Metadata["metadata"].(map[string]interface{}); ok {
+					metadata = md
+				}
+			}
+			result = map[string]interface{}{
+				"pdf_url":  job.PDFURL,
+				"metadata": metadata,
+			}
+		}
+
+		items = append(items, map[string]interface{}{
+			"id":         job.ID.String(),
+			"status":     mapPipelineStatus(job.Status),
+			"prompt":     job.Prompt,
+			"created_at": job.CreatedAt,
+			"updated_at": job.UpdatedAt,
+			"result":     result,
+		})
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		ti, okI := items[i]["updated_at"].(time.Time)
+		tj, okJ := items[j]["updated_at"].(time.Time)
+		if !okI || !okJ {
+			return false
+		}
+		if latest {
+			return ti.After(tj)
+		}
+		return ti.Before(tj)
+	})
+
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+
+	return items, nil
 }
 
 // getCooldown returns the cooldown time in seconds
@@ -254,10 +493,8 @@ Description: %s`,
 		sheet.Course,
 		sheet.Description)
 
-	apiKey := getGeminiKey()
-	model := getGeminiModel()
-
-	response, err := ai.GenerateResponse(apiKey, model, systemPrompt, userPrompt, getCooldown())
+	// Use the new unified AI system
+	response, err := ai.GenerateSimple(ai.TaskUtility, systemPrompt, userPrompt)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": fmt.Sprintf("Failed to generate tags: %v", err)})
 	}
@@ -297,10 +534,8 @@ Description: %s`,
 		request.Course,
 		request.Description)
 
-	apiKey := getGeminiKey()
-	model := getGeminiModel()
-
-	response, err := ai.GenerateResponse(apiKey, model, systemPrompt, userPrompt, getCooldown())
+	// Use the new unified AI system
+	response, err := ai.GenerateSimple(ai.TaskUtility, systemPrompt, userPrompt)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": fmt.Sprintf("Failed to generate subject: %v", err)})
 	}
@@ -319,7 +554,7 @@ Example: ["physics", "mechanics", "motion"]`
 			tagUserPrompt := fmt.Sprintf("Subject: %s\nCourse: %s\nDescription: %s",
 				subject, request.Course, request.Description)
 
-			tagResponse, err := ai.GenerateResponse(apiKey, model, tagSystemPrompt, tagUserPrompt, 0)
+			tagResponse, err := ai.GenerateSimple(ai.TaskUtility, tagSystemPrompt, tagUserPrompt)
 			if err == nil {
 				tags, _ := extractTags(tagResponse)
 				result["tags"] = tags
@@ -361,10 +596,8 @@ Description: %s`,
 		request.Subject,
 		request.Description)
 
-	apiKey := getGeminiKey()
-	model := getGeminiModel()
-
-	response, err := ai.GenerateResponse(apiKey, model, systemPrompt, userPrompt, getCooldown())
+	// Use the new unified AI system
+	response, err := ai.GenerateSimple(ai.TaskUtility, systemPrompt, userPrompt)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": fmt.Sprintf("Failed to generate course: %v", err)})
 	}
@@ -383,7 +616,7 @@ Example: ["calculus", "mathematics", "derivatives"]`
 			tagUserPrompt := fmt.Sprintf("Subject: %s\nCourse: %s\nDescription: %s",
 				request.Subject, course, request.Description)
 
-			tagResponse, err := ai.GenerateResponse(apiKey, model, tagSystemPrompt, tagUserPrompt, 0)
+			tagResponse, err := ai.GenerateSimple(ai.TaskUtility, tagSystemPrompt, tagUserPrompt)
 			if err == nil {
 				tags, _ := extractTags(tagResponse)
 				result["tags"] = tags
@@ -426,10 +659,8 @@ Make an apporiate description with the instructions on how to prepare for the co
 		request.Subject,
 		request.Course)
 
-	apiKey := getGeminiKey()
-	model := getGeminiModel()
-
-	response, err := ai.GenerateResponse(apiKey, model, systemPrompt, userPrompt, getCooldown())
+	// Use the new unified AI system
+	response, err := ai.GenerateSimple(ai.TaskUtility, systemPrompt, userPrompt)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": fmt.Sprintf("Failed to generate description: %v", err)})
 	}
@@ -448,7 +679,7 @@ Example: ["chemistry", "organic", "synthesis"]`
 			tagUserPrompt := fmt.Sprintf("Subject: %s\nCourse: %s\nDescription: %s",
 				request.Subject, request.Course, description)
 
-			tagResponse, err := ai.GenerateResponse(apiKey, model, tagSystemPrompt, tagUserPrompt, 0)
+			tagResponse, err := ai.GenerateSimple(ai.TaskUtility, tagSystemPrompt, tagUserPrompt)
 			if err == nil {
 				tags, _ := extractTags(tagResponse)
 				result["tags"] = tags

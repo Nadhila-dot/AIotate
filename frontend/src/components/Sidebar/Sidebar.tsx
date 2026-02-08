@@ -1,5 +1,5 @@
 import React from "react";
-import { Home, FolderOpen, BookOpen, User, Mail, Settings, ChevronLeft, ChevronRight, Search, SheetIcon, ShieldQuestionIcon, HelpCircleIcon } from "lucide-react";
+import { Home, FolderOpen, BookOpen, User, Mail, Settings, ChevronLeft, ChevronRight, Search, SheetIcon, ShieldQuestionIcon, HelpCircleIcon, Palette } from "lucide-react";
 import { Outlet, Link, useLocation, Routes, Route } from "react-router-dom";
 import { HomeContainer } from "../../containers/index/container";
 import { LoginContainer } from "../../containers/login/loginContainer";
@@ -12,8 +12,8 @@ const sidebarData = [
   { name: "Home", path: "/home", icon: Home },
   { name: "Sheets", path: "/sheets", icon: SheetIcon },
   { name: "Notebooks", path: "/notebooks", icon: BookOpen },
+  { name: "Designer", path: "/designer", icon: Palette },
   { name: "Help", path: "/help", icon: HelpCircleIcon },
-  { name: "Contact", path: "/contact", icon: Mail },
   { name: "Settings", path: "/settings", icon: Settings },
 ];
 
@@ -170,7 +170,7 @@ const Sidebar = ({ isAuthenticated }: { isAuthenticated: boolean }) => {
       <nav style={sidebarStyle}>
         {/* Logo */}
         <div style={logoStyle}>
-          {isCollapsed ? "V" : "Vela"}
+          {isCollapsed ? "AE" : "AIotate"}
         </div>
 
         {/* Search (only show when expanded) */}

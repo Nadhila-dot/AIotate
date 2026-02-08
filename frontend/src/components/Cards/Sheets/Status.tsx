@@ -4,9 +4,12 @@ import { connectToJobWebSocket } from "@/scripts/sheets/statuswebsocket";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Loader } from "lucide-react";
+import { Loader, RotateCcw } from "lucide-react";
 import MarkdownCard from "@/components/Cards/Markdown/markdown";
 import { NeoButton } from "@/components/ui/neo-button";
+import http from "@/http";
+import { toast } from "sonner";
+import { checkPdfAvailable, resolvePdfUrl, waitForPdfReady } from "@/lib/pdf";
 
 type JobUpdate = {
   message: string;
@@ -26,26 +29,68 @@ type JobUpdate = {
   };
 };
 
+type PipelineInfo = {
+  jobId: string;
+  step: "design" | "latex";
+  actions?: string[];
+};
+
+type ModalContent = {
+  heading: string;
+  content: string;
+  optional: boolean;
+  pipeline?: PipelineInfo;
+};
+
 export default function JobUpdates({ jobId }: { jobId: string }) {
-  const [jobStatus, setJobStatus] = useState("processing");
+  const [jobStatus, setJobStatus] = useState<string | null>(null);
   const [updates, setUpdates] = useState<JobUpdate[]>([]);
   const [jobTime, setJobTime] = useState("0s");
-  const [startTime] = useState(Date.now());
+  const [startTime, setStartTime] = useState<number | null>(null);
   const [isCompleted, setIsCompleted] = useState(false);
   const [resultData, setResultData] = useState<any>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
-  const [modalContent, setModalContent] = useState<{heading: string, content: string, optional: boolean}>({
+  const [modalContent, setModalContent] = useState<ModalContent>({
     heading: "",
     content: "",
-    optional: true
+    optional: true,
+    pipeline: undefined
   });
   const [isMarkdownLoading, setIsMarkdownLoading] = useState(true);
   // New state to track queued modals and non-optional modal status
-  const [modalQueue, setModalQueue] = useState<Array<{heading: string, content: string, optional: boolean}>>([]);
+  const [modalQueue, setModalQueue] = useState<Array<ModalContent>>([]);
   const [hasNonOptionalModal, setHasNonOptionalModal] = useState(false);
+  const [actionInput, setActionInput] = useState("");
+  const [isActionLoading, setIsActionLoading] = useState(false);
+  const [isRetrying, setIsRetrying] = useState(false);
+  const [isOpeningPdf, setIsOpeningPdf] = useState(false);
+  const [isPdfReady, setIsPdfReady] = useState<boolean | null>(null);
+
+  const handleRetry = async () => {
+    setIsRetrying(true);
+    try {
+      await http.post(`/api/v1/pipeline/jobs/${jobId}/retry`);
+      toast.success("Retrying job from scratch...");
+      setJobStatus("processing");
+      setIsCompleted(false);
+      setResultData(null);
+      setStartTime(Date.now());
+      setUpdates(prev => [...prev, {
+        message: "Manual retry requested",
+        type: "stage",
+        timestamp: new Date().toLocaleTimeString(),
+        stage: "Pipeline",
+        step: "Retrying",
+      }]);
+    } catch (error) {
+      toast.error("Failed to retry job.");
+    } finally {
+      setIsRetrying(false);
+    }
+  };
 
   useEffect(() => {
-    if (isCompleted) return;
+    if (isCompleted || startTime === null) return;
     const timer = setInterval(() => {
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       setJobTime(`${elapsed}s`);
@@ -59,6 +104,25 @@ export default function JobUpdates({ jobId }: { jobId: string }) {
       return () => clearTimeout(timer);
     }
   }, [modalContent.content]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const checkAvailability = async () => {
+      if (!resultData?.pdf_url) return;
+      setIsPdfReady(null);
+      const available = await checkPdfAvailable(resultData.pdf_url);
+      if (!cancelled) {
+        setIsPdfReady(available);
+      }
+    };
+
+    checkAvailability();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [resultData?.pdf_url]);
 
   // New effect to handle modal queue
   useEffect(() => {
@@ -79,7 +143,7 @@ export default function JobUpdates({ jobId }: { jobId: string }) {
   };
 
   // Function to handle showing a modal with queue logic
-  const showModal = (modalData: {heading: string, content: string, optional: boolean}) => {
+  const showModal = (modalData: ModalContent) => {
     if (isModalOpen) {
       // If a non-optional modal is open, queue the new modal
       setModalQueue(prev => [...prev, modalData]);
@@ -89,7 +153,72 @@ export default function JobUpdates({ jobId }: { jobId: string }) {
       setIsModalOpen(true);
       setIsMarkdownLoading(true);
       setHasNonOptionalModal(!modalData.optional);
+      setActionInput("");
       setTimeout(() => setIsMarkdownLoading(false), 600);
+    }
+  };
+
+  const handlePipelineAction = async (action: string) => {
+    if (!modalContent.pipeline) return;
+
+    const { jobId, step } = modalContent.pipeline;
+    setIsActionLoading(true);
+
+    try {
+      if (step === "design") {
+        if (action === "approve") {
+          await http.post(`/api/v1/pipeline/jobs/${jobId}/design/approve`);
+          toast.success("Design approved. Moving to LaTeX.");
+        } else if (action === "refine") {
+          if (!actionInput.trim()) {
+            toast.error("Please add refinement notes.");
+            setIsActionLoading(false);
+            return;
+          }
+          await http.post(`/api/v1/pipeline/jobs/${jobId}/design/refine`, {
+            refinement: actionInput.trim(),
+          });
+          toast.success("Design refinement sent.");
+        } else if (action === "regenerate") {
+          await http.post(`/api/v1/pipeline/jobs/${jobId}/design/refine`, {
+            refinement: "Regenerate the design with a fresh approach.",
+          });
+          toast.success("Design regeneration requested.");
+        }
+      }
+
+      if (step === "latex") {
+        if (action === "approve") {
+          await http.post(`/api/v1/pipeline/jobs/${jobId}/latex/approve`);
+          toast.success("LaTeX approved. Starting compilation.");
+        } else if (action === "edit") {
+          if (!actionInput.trim()) {
+            toast.error("Please paste the updated LaTeX.");
+            setIsActionLoading(false);
+            return;
+          }
+          await http.post(`/api/v1/pipeline/jobs/${jobId}/latex/edit`, {
+            latex: actionInput.trim(),
+          });
+          toast.success("LaTeX updated.");
+        } else if (action === "fix") {
+          if (!actionInput.trim()) {
+            toast.error("Please provide the error log to fix.");
+            setIsActionLoading(false);
+            return;
+          }
+          await http.post(`/api/v1/pipeline/jobs/${jobId}/latex/fix`, {
+            errorLog: actionInput.trim(),
+          });
+          toast.success("AI fix requested.");
+        }
+      }
+
+      handleModalClose();
+    } catch (error) {
+      toast.error("Pipeline action failed.");
+    } finally {
+      setIsActionLoading(false);
     }
   };
 
@@ -109,6 +238,7 @@ export default function JobUpdates({ jobId }: { jobId: string }) {
       const result = data.result;
       const error = payload.error || data.error;
       const modal = payload.modal;
+      const pipelineInfo = payload.extra?.pipeline;
       
       // Enhance message for stage updates
       if (type === "stage" && stage && step) {
@@ -136,18 +266,24 @@ export default function JobUpdates({ jobId }: { jobId: string }) {
         showModal({
           heading: modal.heading || "Review Content",
           content: modal.content,
-          optional: modal.optional !== undefined ? modal.optional : true
+          optional: modal.optional !== undefined ? modal.optional : true,
+          pipeline: pipelineInfo
         });
       }
 
       // Update job status based on type
+      if (startTime === null) {
+        setStartTime(Date.now());
+      }
       if (type === "completed") {
         setJobStatus("completed");
         setIsCompleted(true);
         if (result) {
           setResultData(result);
+        } else if (payload.result) {
+          setResultData(payload.result);
         }
-      } else if (type === "processing" || type === "progress") {
+      } else if (type === "processing" || type === "progress" || type === "stage") {
         setJobStatus("processing");
       } else if (type === "error") {
         setJobStatus("error");
@@ -171,6 +307,8 @@ export default function JobUpdates({ jobId }: { jobId: string }) {
 
   const getStatusText = () => {
     switch (jobStatus) {
+      case null:
+        return "Waiting";
       case "completed":
         return "Completed";
       case "error":
@@ -180,10 +318,27 @@ export default function JobUpdates({ jobId }: { jobId: string }) {
     }
   };
 
-  const openPdfInNewTab = (url: string) => {
-    if (url) {
-      window.open(url, '_blank');
+  const openPdfInNewTab = async (url: string) => {
+    if (!url || isOpeningPdf) return;
+
+    setIsOpeningPdf(true);
+    toast.info("Preparing PDF. This can take a few seconds...");
+
+    const ready = await waitForPdfReady(url, {
+      retries: 8,
+      intervalMs: 1500,
+    });
+
+    if (ready) {
+      setIsPdfReady(true);
+      window.open(resolvePdfUrl(url), "_blank");
+      toast.success("Opening PDF...");
+    } else {
+      setIsPdfReady(false);
+      toast.error("PDF is still being published. Please try again shortly.");
     }
+
+    setIsOpeningPdf(false);
   };
 
   const getUpdateBadgeColor = (type: string) => {
@@ -230,16 +385,40 @@ export default function JobUpdates({ jobId }: { jobId: string }) {
               <h3 className="text-lg font-bold mb-2">Job Completed Successfully!</h3>
               <button 
                 onClick={() => openPdfInNewTab(resultData.pdf_url)}
+                disabled={isOpeningPdf}
                 className="px-4 py-2 bg-blue-600 text-white font-medium rounded-md hover:bg-blue-700 transition-colors"
               >
-                Open PDF Document
+                {isOpeningPdf ? "Opening..." : "Open PDF Document"}
               </button>
+              {isPdfReady === false && (
+                <div className="mt-2 text-xs text-gray-600">
+                  PDF is still being published. Try again in a few seconds.
+                </div>
+              )}
               {resultData.metadata && (
                 <div className="mt-3 p-3 bg-gray-50 border border-gray-200 rounded-md">
                   <h4 className="text-sm font-bold mb-1">Document Metadata:</h4>
                   <pre className="text-xs overflow-auto max-h-40">{JSON.stringify(resultData.metadata, null, 2)}</pre>
                 </div>
               )}
+            </div>
+          )}
+
+          {/* Retry button for failed jobs */}
+          {jobStatus === "error" && (
+            <div className="mb-4 p-4 bg-red-50 border-2 border-red-500 rounded-lg flex items-center justify-between">
+              <div>
+                <h3 className="text-lg font-bold text-red-800">Job Failed</h3>
+                <p className="text-sm text-red-600">Something went wrong during generation. You can retry the job.</p>
+              </div>
+              <button
+                onClick={handleRetry}
+                disabled={isRetrying}
+                className="flex items-center gap-2 px-5 py-2.5 bg-red-600 text-white font-bold rounded-lg border-2 border-black shadow-[3px_3px_0_0_#000] hover:shadow-[5px_5px_0_0_#000] hover:-translate-y-0.5 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <RotateCcw className={`w-4 h-4 ${isRetrying ? "animate-spin" : ""}`} />
+                {isRetrying ? "Retrying..." : "Retry"}
+              </button>
             </div>
           )}
           
@@ -357,6 +536,71 @@ export default function JobUpdates({ jobId }: { jobId: string }) {
               </div>
             ) : (
               <MarkdownCard content={modalContent.content} />
+            )}
+
+            {modalContent.pipeline && (
+              <div className="mt-6 border-t-2 border-black pt-4">
+                <h4 className="text-lg font-bold mb-2">Pipeline Actions</h4>
+                <p className="text-sm text-gray-600 mb-3">
+                  {modalContent.pipeline.step === "design"
+                    ? "Approve the design or provide refinement notes."
+                    : "Approve the LaTeX or paste edits / error logs for AI fixes."}
+                </p>
+
+                <textarea
+                  className="w-full border-2 border-black rounded-lg px-3 py-2 shadow-[2px_2px_0_0_#000] focus:outline-none focus:ring-2 focus:ring-black text-sm"
+                  rows={6}
+                  placeholder={
+                    modalContent.pipeline.step === "design"
+                      ? "Refinement notes (optional for refine/regenerate)"
+                      : "Paste updated LaTeX or error log"
+                  }
+                  value={actionInput}
+                  onChange={(e) => setActionInput(e.target.value)}
+                />
+
+                <div className="mt-4 flex flex-wrap gap-3">
+                  {modalContent.pipeline.step === "design" && (
+                    <>
+                      <NeoButton
+                        color="green"
+                        title={isActionLoading ? "Working..." : "Approve Design"}
+                        onClick={() => handlePipelineAction("approve")}
+                      />
+                      <NeoButton
+                        color="blue"
+                        title={isActionLoading ? "Working..." : "Refine Design"}
+                        onClick={() => handlePipelineAction("refine")}
+                      />
+                      <NeoButton
+                        color="yellow"
+                        title={isActionLoading ? "Working..." : "Regenerate"}
+                        onClick={() => handlePipelineAction("regenerate")}
+                      />
+                    </>
+                  )}
+
+                  {modalContent.pipeline.step === "latex" && (
+                    <>
+                      <NeoButton
+                        color="green"
+                        title={isActionLoading ? "Working..." : "Approve LaTeX"}
+                        onClick={() => handlePipelineAction("approve")}
+                      />
+                      <NeoButton
+                        color="blue"
+                        title={isActionLoading ? "Working..." : "Update LaTeX"}
+                        onClick={() => handlePipelineAction("edit")}
+                      />
+                      <NeoButton
+                        color="yellow"
+                        title={isActionLoading ? "Working..." : "AI Fix"}
+                        onClick={() => handlePipelineAction("fix")}
+                      />
+                    </>
+                  )}
+                </div>
+              </div>
             )}
           </div>
         </DialogContent>

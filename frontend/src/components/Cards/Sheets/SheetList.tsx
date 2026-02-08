@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from "react";
+import React, { useEffect, useState } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import http from "@/http";
 import clsx from "clsx";
@@ -6,6 +6,7 @@ import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
 import { NeoButton } from "@/components/ui/neo-button";
 import { deleteJob } from "@/scripts/sheets/delete";
+import { checkPdfAvailable, resolvePdfUrl, waitForPdfReady } from "@/lib/pdf";
 
 function useDebounce(value: string, delay: number) {
   const [debounced, setDebounced] = useState(value);
@@ -21,6 +22,8 @@ export default function SheetListCard() {
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [openingId, setOpeningId] = useState<string | null>(null);
+  const [pdfReadyMap, setPdfReadyMap] = useState<Record<string, boolean>>({});
   const debouncedSearch = useDebounce(search, 400);
 
   // Fetch queue items
@@ -33,6 +36,90 @@ export default function SheetListCard() {
       setLoading(false);
     }).catch(() => setLoading(false));
   }, [debouncedSearch]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const checkAvailability = async () => {
+      for (let idx = 0; idx < items.length; idx += 1) {
+        const item = items[idx];
+        const itemKey = item.id ?? String(idx);
+        if (item?.status !== "completed" || !item?.result?.pdf_url) continue;
+        if (pdfReadyMap[itemKey] !== undefined) continue;
+
+        const available = await checkPdfAvailable(item.result.pdf_url);
+        if (!cancelled) {
+          setPdfReadyMap((prev) => ({
+            ...prev,
+            [itemKey]: available,
+          }));
+        }
+      }
+    };
+
+    if (items.length > 0) {
+      checkAvailability();
+    }
+
+    return () => {
+      cancelled = true;
+    };
+  }, [items, pdfReadyMap]);
+
+  const handleOpenPdf = async (item: any, itemKey: string) => {
+    if (!item?.result?.pdf_url) return;
+
+    setOpeningId(itemKey);
+    toast.info("Preparing PDF. This can take a few seconds...");
+
+    const ready = await waitForPdfReady(item.result.pdf_url, {
+      retries: 8,
+      intervalMs: 1500,
+    });
+
+    if (ready) {
+      setPdfReadyMap((prev) => ({
+        ...prev,
+        [itemKey]: true,
+      }));
+      window.open(resolvePdfUrl(item.result.pdf_url), "_blank");
+      toast.success("Opening PDF...");
+    } else {
+      setPdfReadyMap((prev) => ({
+        ...prev,
+        [itemKey]: false,
+      }));
+      toast.error("PDF is still being published. Please try again shortly.");
+    }
+
+    setOpeningId(null);
+  };
+
+  const buildRecreateUrl = (item: any) => {
+    const rawPrompt = item?.prompt;
+    if (!rawPrompt || typeof rawPrompt !== "string") return "/sheets";
+
+    try {
+      const prompt = JSON.parse(rawPrompt);
+      const params = new URLSearchParams();
+
+      if (prompt.subject) params.set("subject", String(prompt.subject));
+      if (prompt.course) params.set("course", String(prompt.course));
+      if (prompt.description) params.set("description", String(prompt.description));
+      if (prompt.curriculum) params.set("curriculum", String(prompt.curriculum));
+      if (prompt.specialInstructions) params.set("specialInstructions", String(prompt.specialInstructions));
+      if (prompt.styleName) params.set("styleName", String(prompt.styleName));
+      if (prompt.mode) params.set("mode", String(prompt.mode));
+      if (prompt.webSearchQuery) params.set("webSearchQuery", String(prompt.webSearchQuery));
+      if (typeof prompt.webSearchEnabled === "boolean") params.set("webSearchEnabled", String(prompt.webSearchEnabled));
+      if (Array.isArray(prompt.tags)) params.set("tags", prompt.tags.join(","));
+
+      const queryString = params.toString();
+      return queryString ? `/sheets?${queryString}` : "/sheets";
+    } catch {
+      return "/sheets";
+    }
+  };
 
   const handleDelete = async (id: string) => {
     setDeletingId(id);
@@ -64,10 +151,24 @@ export default function SheetListCard() {
             <div className="text-lg font-medium text-gray-700">Loading sheets...</div>
           </div>
         ) : items.length === 0 ? (
-          <div className="text-base font-medium text-gray-600">No sheets found.</div>
+          <div className="flex flex-col items-center justify-center py-12">
+            <img 
+              src="/undraw/empty.svg" 
+              alt="No sheets" 
+              className="w-64 h-64 mb-6 opacity-80"
+            />
+            <h2 className="text-2xl font-bold text-gray-800 mb-2">No Sheets Found</h2>
+            <p className="text-base text-gray-600 text-center max-w-md">
+              {search 
+                ? `No sheets match "${search}". Try a different search term.`
+                : "You haven't created any sheets yet. Create your first sheet to get started!"}
+            </p>
+          </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {items.map((item, idx) => (
+            {items.map((item, idx) => {
+              const itemKey = item.id ?? String(idx);
+              return (
               <div
                 key={item.id || idx}
                 className={clsx(
@@ -82,8 +183,7 @@ export default function SheetListCard() {
                 )}
                 onClick={() => {
                   if (item.status === "completed" && item.result && item.result.pdf_url) {
-                    toast.success("Redirecting to content...");
-                    window.open(item.result.pdf_url, "_blank");
+                    handleOpenPdf(item, itemKey);
                   }
                 }}
               >
@@ -158,13 +258,18 @@ export default function SheetListCard() {
                   <div className="mb-2 text-xs text-gray-500">
                     Created: {item.created_at ? new Date(item.created_at).toLocaleString() : "N/A"}
                   </div>
-                  {item.status === "completed" && item.result && item.result.pdf_url && (
+                  {item.status === "completed" && item.result && item.result.pdf_url && pdfReadyMap[itemKey] && (
                     <div className="mb-2 flex-grow">
                       <iframe
-                        src={item.result.pdf_url}
+                        src={resolvePdfUrl(item.result.pdf_url)}
                         title={`PDF-${item.id}`}
                         className="w-full h-40 border border-black rounded"
                       />
+                    </div>
+                  )}
+                  {item.status === "completed" && item.result && item.result.pdf_url && pdfReadyMap[itemKey] === false && (
+                    <div className="mb-2 flex-grow text-xs text-gray-600 border border-dashed border-gray-400 rounded p-3">
+                      PDF is still being published. Use Open to retry in a few seconds.
                     </div>
                   )}
                   {item.result && typeof item.result === "string" && (
@@ -194,16 +299,24 @@ export default function SheetListCard() {
                     {item.status !== "retrying" && (
                       <NeoButton
                         color="blue"
-                        title="Open"
+                        title={openingId === itemKey ? "Opening..." : "Open"}
+                        disabled={openingId === itemKey}
                         onClick={e => {
                         e.stopPropagation();
-                        toast.success("If possible, redirecting to content...");
-                        window.open(item.result.pdf_url, "_blank");
-                        
+                        handleOpenPdf(item, itemKey);
                         }}
                         className="text-xs px-4 py-1"
                       />
                     )}
+                    <NeoButton
+                      color="yellow"
+                      title="Recreate"
+                      onClick={e => {
+                      e.stopPropagation();
+                      window.location.href = buildRecreateUrl(item);
+                      }}
+                      className="text-xs px-4 py-1"
+                    />
                     <NeoButton
                       color="red"
                       title={deletingId === item.id ? "Deleting..." : "Delete"}
@@ -215,9 +328,10 @@ export default function SheetListCard() {
                       className="text-xs px-4 py-1"
                     />
                     </div>
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+              })}
           </div>
         )}
       </CardContent>

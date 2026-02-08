@@ -8,6 +8,7 @@ import { HelpContainer } from "@/containers/help/helpContainer";
 import { SheetsContainer } from "@/containers/sheets/sheetsContainer";
 import { SheetsStatusContainer } from "@/containers/sheets/sheetsStatus";
 import { NotebooksContainer } from "@/containers/notebooks/notebookContainer";
+import { DesignerContainer } from "@/containers/designer/designerContainer";
 
 
 interface MainContentProps {
@@ -22,6 +23,7 @@ const MainContent: React.FC<MainContentProps> = ({ isAuthenticated }) => (
         <Route path="/sheets" element={<SheetsContainer />} />
         <Route path="/sheets/status" element={<SheetsStatusContainer />} />
         <Route path="/notebooks" element={<NotebooksContainer />} />
+        <Route path="/designer" element={<DesignerContainer />} />
         
         <Route path="/login" element={<LoginContainer />} />
         {isAuthenticated && (

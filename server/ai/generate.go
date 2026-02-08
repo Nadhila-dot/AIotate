@@ -1,7 +1,7 @@
 package ai
 
 import (
-	_"bytes"
+	_ "bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,11 +10,12 @@ import (
 	"net/http"
 	"os"
 	"regexp"
-_	"strconv"
+	_ "strconv"
 	"strings"
 	"time"
 
-	"nadhi.dev/sarvar/fun/latex"
+	store "nadhi.dev/sarvar/fun/database"
+	"nadhi.dev/sarvar/fun/db"
 )
 
 const (
@@ -33,12 +34,18 @@ const (
 
 // GenerationRequest represents the request structure for sheet generation
 type GenerationRequest struct {
-	Subject             string   `json:"subject"`
-	Course              string   `json:"course"`
-	Description         string   `json:"description"`
-	Tags                []string `json:"tags"`
-	Curriculum          string   `json:"curriculum"`
-	SpecialInstructions string   `json:"specialInstructions"`
+	Subject             string       `json:"subject"`
+	Course              string       `json:"course"`
+	Description         string       `json:"description"`
+	Tags                []string     `json:"tags"`
+	Curriculum          string       `json:"curriculum"`
+	SpecialInstructions string       `json:"specialInstructions"`
+	StyleName           string       `json:"styleName"`
+	Username            string       `json:"username"`
+	Mode                string       `json:"mode"`
+	WebSearchQuery      string       `json:"webSearchQuery"`
+	WebSearchEnabled    bool         `json:"webSearchEnabled"`
+	Attachments         []Attachment `json:"attachments"`
 }
 
 // GenerationResult contains the generated content and metadata
@@ -48,22 +55,19 @@ type GenerationResult struct {
 }
 
 // GenerateSheet takes user input and produces LaTeX content using Gemini 2.5 Pro
-func GenerateSheet(apiKey string, request *GenerationRequest) (*GenerationResult, error) {
-	if apiKey == "" {
-		return nil, fmt.Errorf("API key is required")
-	}
-
+// GenerateSheet takes user input and produces LaTeX content using the configured AI provider
+func GenerateSheet(request *GenerationRequest) (*GenerationResult, error) {
 	if request == nil {
 		return nil, fmt.Errorf("generation request cannot be nil")
 	}
 
-	model := DefaultModel
-	systemPrompt := buildSystemPrompt()
+	systemPrompt := buildSystemPrompt(request)
 	userPrompt := buildUserPrompt(request)
 
-	log.Printf("Generating sheet with model: %s", model)
+	log.Printf("Generating sheet with configured AI provider")
 
-	response, err := generateGeminiResponse(apiKey, model, systemPrompt, userPrompt, MaxRetries)
+	// Use the unified API with LaTeX generation task type
+	response, err := GenerateWithRetry(TaskLaTeXGeneration, systemPrompt, userPrompt, MaxRetries)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate content: %w", err)
 	}
@@ -80,9 +84,60 @@ func GenerateSheet(apiKey string, request *GenerationRequest) (*GenerationResult
 	}, nil
 }
 
+// defaultStylePrompt contains the visual styling section of the system prompt.
+const defaultStylePrompt = `% Document styling for visual appeal
+\\definecolor{primary}{RGB}{25,103,210}
+\\definecolor{secondary}{RGB}{234,67,53}
+\\definecolor{accent}{RGB}{251,188,4}
+\\definecolor{light}{RGB}{242,242,242}
+
+\\hypersetup{colorlinks=true,linkcolor=primary}
+\\setlength{\\parindent}{0pt}
+\\setlength{\\parskip}{6pt}
+
+\\title{\\textcolor{primary}{\\Large TITLE_OF_WORKSHEET}}
+\\author{\\textcolor{secondary}{Course: COURSE_NAME}}
+\\date{\\today}`
+
+// getStylePromptForRequest resolves the style prompt from the NoSQL store.
+// Priority: explicit style name > user's default style > defaultStylePrompt
+func getStylePromptForRequest(request *GenerationRequest) string {
+	if request == nil {
+		return defaultStylePrompt
+	}
+
+	username := strings.TrimSpace(request.Username)
+	if username == "" {
+		return defaultStylePrompt
+	}
+
+	styleName := strings.TrimSpace(request.StyleName)
+	if styleName != "" {
+		if style, err := store.GetStyle(db.StylesDB, username, styleName); err == nil {
+			if style != nil && strings.TrimSpace(style.Prompt) != "" {
+				return style.Prompt
+			}
+		}
+	}
+
+	if style, err := store.GetDefaultStyle(db.StylesDB, username); err == nil {
+		if style != nil && strings.TrimSpace(style.Prompt) != "" {
+			return style.Prompt
+		}
+	}
+
+	return defaultStylePrompt
+}
+
+// ResolveStylePrompt exposes the style prompt lookup for other packages.
+func ResolveStylePrompt(request *GenerationRequest) string {
+	return getStylePromptForRequest(request)
+}
+
 // buildSystemPrompt creates the system prompt for the Gemini model
-func buildSystemPrompt() string {
-    return `You are a professional educator and LaTeX expert. Your task is to generate 
+func buildSystemPrompt(request *GenerationRequest) string {
+	stylePrompt := getStylePromptForRequest(request)
+	return `You are a professional educator and LaTeX expert. Your task is to generate 
 a comprehensive educational worksheet that will maximize student learning outcomes.
 
 IMPORTANT: Your response MUST follow this exact format with NO DEVIATIONS:
@@ -99,19 +154,7 @@ IMPORTANT: Your response MUST follow this exact format with NO DEVIATIONS:
 \\usepackage{tcolorbox}
 \\usepackage{hyperref}
 
-% Document styling for visual appeal
-\\definecolor{primary}{RGB}{25,103,210}
-\\definecolor{secondary}{RGB}{234,67,53}
-\\definecolor{accent}{RGB}{251,188,4}
-\\definecolor{light}{RGB}{242,242,242}
-
-\\hypersetup{colorlinks=true,linkcolor=primary}
-\\setlength{\\parindent}{0pt}
-\\setlength{\\parskip}{6pt}
-
-\\title{\\textcolor{primary}{\\Large TITLE_OF_WORKSHEET}}
-\\author{\\textcolor{secondary}{Course: COURSE_NAME}}
-\\date{\\today}
+` + stylePrompt + `
 
 \\begin{document}
 
@@ -206,100 +249,100 @@ type geminiResponse struct {
 
 // generateGeminiResponse calls the Gemini API to generate content
 func generateGeminiResponse(apiKey, model, systemPrompt, userPrompt string, maxRetries int) (string, error) {
-    url := fmt.Sprintf(GeminiEndpoint, model, apiKey)
+	url := fmt.Sprintf(GeminiEndpoint, model, apiKey)
 
-    // Combine system prompt and user prompt since Gemini doesn't support system role
-    combinedPrompt := systemPrompt + "\n\n" + userPrompt
+	// Combine system prompt and user prompt since Gemini doesn't support system role
+	combinedPrompt := systemPrompt + "\n\n" + userPrompt
 
-    // Create request with valid roles only
-    reqBody := geminiRequest{
-        Contents: []geminiContent{
-            {
-                Role: "user", // Use "user" role instead of "system"
-                Parts: []part{
-                    {Text: combinedPrompt},
-                },
-            },
-        },
-    }
+	// Create request with valid roles only
+	reqBody := geminiRequest{
+		Contents: []geminiContent{
+			{
+				Role: "user", // Use "user" role instead of "system"
+				Parts: []part{
+					{Text: combinedPrompt},
+				},
+			},
+		},
+	}
 
-    reqJSON, err := json.Marshal(reqBody)
-    if err != nil {
-        return "", fmt.Errorf("failed to marshal request: %w", err)
-    }
+	reqJSON, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %w", err)
+	}
 
-    // Debug request being sent
-    log.Printf("[DEBUG] Sending request to Gemini API with model: %s", model)
-    log.Printf("[DEBUG] Request length: %d bytes", len(reqJSON))
+	// Debug request being sent
+	log.Printf("[DEBUG] Sending request to Gemini API with model: %s", model)
+	log.Printf("[DEBUG] Request length: %d bytes", len(reqJSON))
 
-    var response string
-    var lastErr error
+	var response string
+	var lastErr error
 
-    // Implement retry logic
-    for attempt := 0; attempt < maxRetries; attempt++ {
-        if attempt > 0 {
-            log.Printf("Retrying API request (attempt %d/%d)", attempt+1, maxRetries)
-            time.Sleep(RetryDelay * time.Duration(attempt)) // Increase delay with each retry
-        }
+	// Implement retry logic
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			log.Printf("Retrying API request (attempt %d/%d)", attempt+1, maxRetries)
+			time.Sleep(RetryDelay * time.Duration(attempt)) // Increase delay with each retry
+		}
 
-        req, err := http.NewRequest("POST", url, strings.NewReader(string(reqJSON)))
-        if err != nil {
-            lastErr = err
-            log.Printf("[ERROR] Failed to create request: %v", err)
-            continue
-        }
+		req, err := http.NewRequest("POST", url, strings.NewReader(string(reqJSON)))
+		if err != nil {
+			lastErr = err
+			log.Printf("[ERROR] Failed to create request: %v", err)
+			continue
+		}
 
-        req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", "application/json")
 
-		 // Set a longer timeout for the HTTP client
-		 // Longer timeouts aka timeout
-        client := &http.Client{Timeout: 6000 * time.Second}
-        resp, err := client.Do(req)
-        if err != nil {
-            lastErr = err
-            log.Printf("[ERROR] Failed to execute request: %v", err)
-            continue
-        }
+		// Set a longer timeout for the HTTP client
+		// Longer timeouts aka timeout
+		client := &http.Client{Timeout: 6000 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			log.Printf("[ERROR] Failed to execute request: %v", err)
+			continue
+		}
 
-        // Read the response body for debugging if there's an error
-        var respBody []byte
-        if resp.StatusCode != http.StatusOK {
-            respBody, _ = io.ReadAll(resp.Body)
-            resp.Body.Close()
-            
-            log.Printf("[ERROR] API returned status %d: %s", resp.StatusCode, string(respBody))
-            lastErr = fmt.Errorf("API returned non-200 status: %d - %s", resp.StatusCode, string(respBody))
-            
-            // For rate limiting errors, increase the delay significantly
-            if resp.StatusCode == 429 {
-                log.Printf("[WARN] Rate limited by API, increasing delay before retry")
-                time.Sleep(5 * time.Second) // Add extra delay for rate limiting
-            }
-            
-            continue
-        }
+		// Read the response body for debugging if there's an error
+		var respBody []byte
+		if resp.StatusCode != http.StatusOK {
+			respBody, _ = io.ReadAll(resp.Body)
+			resp.Body.Close()
 
-        var geminiResp geminiResponse
-        if err := json.NewDecoder(resp.Body).Decode(&geminiResp); err != nil {
-            lastErr = err
-            log.Printf("[ERROR] Failed to decode API response: %v", err)
-            resp.Body.Close()
-            continue
-        }
-        resp.Body.Close()
+			log.Printf("[ERROR] API returned status %d: %s", resp.StatusCode, string(respBody))
+			lastErr = fmt.Errorf("API returned non-200 status: %d - %s", resp.StatusCode, string(respBody))
 
-        if len(geminiResp.Candidates) == 0 || len(geminiResp.Candidates[0].Content.Parts) == 0 {
-            lastErr = fmt.Errorf("empty response from API")
-            log.Printf("[ERROR] Empty response from API")
-            continue
-        }
+			// For rate limiting errors, increase the delay significantly
+			if resp.StatusCode == 429 {
+				log.Printf("[WARN] Rate limited by API, increasing delay before retry")
+				time.Sleep(5 * time.Second) // Add extra delay for rate limiting
+			}
 
-        response = geminiResp.Candidates[0].Content.Parts[0].Text
-        log.Printf("[DEBUG] Successfully received response from Gemini API (length: %d bytes)", len(response))
-        return response, nil
-    }
+			continue
+		}
 
-    return "", fmt.Errorf("failed after %d attempts: %w", maxRetries, lastErr)
+		var geminiResp geminiResponse
+		if err := json.NewDecoder(resp.Body).Decode(&geminiResp); err != nil {
+			lastErr = err
+			log.Printf("[ERROR] Failed to decode API response: %v", err)
+			resp.Body.Close()
+			continue
+		}
+		resp.Body.Close()
+
+		if len(geminiResp.Candidates) == 0 || len(geminiResp.Candidates[0].Content.Parts) == 0 {
+			lastErr = fmt.Errorf("empty response from API")
+			log.Printf("[ERROR] Empty response from API")
+			continue
+		}
+
+		response = geminiResp.Candidates[0].Content.Parts[0].Text
+		log.Printf("[DEBUG] Successfully received response from Gemini API (length: %d bytes)", len(response))
+		return response, nil
+	}
+
+	return "", fmt.Errorf("failed after %d attempts: %w", maxRetries, lastErr)
 }
 
 // extractContent parses the generated response to extract LaTeX and metadata
@@ -344,7 +387,8 @@ func extractContent(response string) (string, map[string]string, error) {
 }
 
 // GenerateSheetForQueue is used by the sheet queue system to process generation requests
-func GenerateSheetForQueue(ctx context.Context, apiKey string, request *GenerationRequest) (*GenerationResult, error) {
+// GenerateSheetForQueue is used by the sheet queue system to process generation requests
+func GenerateSheetForQueue(ctx context.Context, request *GenerationRequest) (*GenerationResult, error) {
 	log.Printf("[DEBUG] Starting GenerateSheetForQueue")
 
 	if request == nil {
@@ -364,7 +408,7 @@ func GenerateSheetForQueue(ctx context.Context, apiKey string, request *Generati
 	// Run generation in a goroutine to respect context cancellation
 	go func() {
 		log.Printf("[DEBUG] Starting generation goroutine")
-		result, err := GenerateSheet(apiKey, request)
+		result, err := GenerateSheet(request)
 		if err != nil {
 			log.Printf("[ERROR] GenerateSheet failed: %v", err)
 			errChan <- err
@@ -418,63 +462,52 @@ func SaveGeneratedContent(outputDir, jobID string, result *GenerationResult) err
 	return nil
 }
 
-func ProcessGeminiGeneration(ctx context.Context, apiKey string, jobID string, req *GenerationRequest) (map[string]interface{}, error) {
-    log.Printf("[DEBUG] Starting ProcessGeminiGeneration for job ID: %s", jobID)
+func ProcessGeneration(ctx context.Context, jobID string, req *GenerationRequest) (map[string]interface{}, error) {
+	log.Printf("[DEBUG] Starting AI generation for job ID: %s", jobID)
 
-    // Debug the request content
-    if req == nil {
-        log.Printf("[ERROR] Request is nil for job ID: %s", jobID)
-        return nil, fmt.Errorf("generation request cannot be nil")
-    }
+	// Debug the request content
+	if req == nil {
+		log.Printf("[ERROR] Request is nil for job ID: %s", jobID)
+		return nil, fmt.Errorf("generation request cannot be nil")
+	}
 
-    // Log the request details
-    reqJSON, err := json.MarshalIndent(req, "", "  ")
-    if err != nil {
-        log.Printf("[ERROR] Failed to marshal request for debugging: %v", err)
-    } else {
-        log.Printf("[DEBUG] Generation request for job %s: %s", jobID, string(reqJSON))
-    }
+	// Log the request details
+	reqJSON, err := json.MarshalIndent(req, "", "  ")
+	if err != nil {
+		log.Printf("[ERROR] Failed to marshal request for debugging: %v", err)
+	} else {
+		log.Printf("[DEBUG] Generation request for job %s: %s", jobID, string(reqJSON))
+	}
 
-    // Generate sheet content
-    log.Printf("[DEBUG] Calling GenerateSheetForQueue for job ID: %s", jobID)
-    result, err := GenerateSheetForQueue(ctx, apiKey, req)
-    if err != nil {
-        log.Printf("[ERROR] Generation failed for job ID %s: %v", jobID, err)
-        return nil, fmt.Errorf("generation failed: %w", err)
-    }
+	// Generate sheet content using the unified API
+	log.Printf("[DEBUG] Calling GenerateSheetForQueue for job ID: %s", jobID)
+	result, err := GenerateSheetForQueue(ctx, req)
+	if err != nil {
+		log.Printf("[ERROR] Generation failed for job ID %s: %v", jobID, err)
+		return nil, fmt.Errorf("generation failed: %w", err)
+	}
 
-    log.Printf("[DEBUG] Successfully generated content for job ID: %s", jobID)
+	log.Printf("[DEBUG] Successfully generated content for job ID: %s", jobID)
 
-    // Save generated content to files
-    outputDir := fmt.Sprintf("./generated/%s", jobID)
-    log.Printf("[DEBUG] Saving content to directory: %s", outputDir)
+	// Save generated content to files
+	outputDir := fmt.Sprintf("./generated/%s", jobID)
+	log.Printf("[DEBUG] Saving content to directory: %s", outputDir)
 
-    if err := SaveGeneratedContent(outputDir, jobID, result); err != nil {
-        log.Printf("[ERROR] Failed to save content for job ID %s: %v", jobID, err)
-        return nil, fmt.Errorf("failed to save content: %w", err)
-    }
+	if err := SaveGeneratedContent(outputDir, jobID, result); err != nil {
+		log.Printf("[ERROR] Failed to save content for job ID %s: %v", jobID, err)
+		return nil, fmt.Errorf("failed to save content: %w", err)
+	}
 
-    // Parse the LaTeX content to check for errors
-    log.Printf("[DEBUG] Validating LaTeX content for job ID: %s", jobID)
-    parseResult, err := latex.ParseLaTeX(result.LaTeX)
-    if err != nil {
-        log.Printf("[ERROR] LaTeX validation failed for job ID %s: %v", jobID, err)
-        return nil, fmt.Errorf("LaTeX validation failed: %w", err)
-    }
+	log.Printf("[DEBUG] Successfully processed job ID: %s", jobID)
 
-    log.Printf("[DEBUG] Successfully processed job ID: %s", jobID)
-
-    // Return results for the queue system, including the raw LaTeX content
-    return map[string]interface{}{
-        "jobID":      jobID,
-        "latexPath":  fmt.Sprintf("%s/%s.tex", outputDir, jobID),
-        "metaPath":   fmt.Sprintf("%s/%s.meta.json", outputDir, jobID),
-        "metadata":   result.Metadata,
-        "parseInfo":  parseResult,
-        "successful": true,
-        "latexContent": result.LaTeX, // Include the raw LaTeX content
-        "rawResponse": result.LaTeX,  // Add the raw response for review
-		// idk why two but don't want to break this mess
-    }, nil
+	// Return results for the queue system, including the raw LaTeX content
+	return map[string]interface{}{
+		"jobID":        jobID,
+		"latexPath":    fmt.Sprintf("%s/%s.tex", outputDir, jobID),
+		"metaPath":     fmt.Sprintf("%s/%s.meta.json", outputDir, jobID),
+		"metadata":     result.Metadata,
+		"successful":   true,
+		"latexContent": result.LaTeX, // Include the raw LaTeX content
+		"rawResponse":  result.LaTeX, // Add the raw response for review
+	}, nil
 }
-

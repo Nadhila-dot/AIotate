@@ -11,7 +11,7 @@ import (
 )
 
 // ConvertLatexToPDFWithRetry tries to convert LaTeX to PDF with AI-powered fixes
-func ConvertLatexToPDFWithRetry(latexContent, texFilename, outputPath, apiKey string) (string, error) {
+func ConvertLatexToPDFWithRetry(latexContent, texFilename, outputPath string) (string, error) {
 	const maxAttempts = 3
 	var conversionErr error
 
@@ -57,10 +57,10 @@ func ConvertLatexToPDFWithRetry(latexContent, texFilename, outputPath, apiKey st
 		// Get error message from last attempt
 		errorMsg = extractErrorMessage(conversionErr)
 
-		// Request fix from Gemini
-		fixedContent, err := FixLatexWithGemini(apiKey, currentContent, errorMsg)
+		// Request fix from AI
+		fixedContent, err := FixLatexWithAI(currentContent, errorMsg)
 		if err != nil {
-			log.Printf("Failed to get Gemini fix: %v", err)
+			log.Printf("Failed to get AI fix: %v", err)
 			continue
 		}
 

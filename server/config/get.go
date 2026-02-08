@@ -1,39 +1,53 @@
 package config
 
 import (
-    "encoding/json"
-    "os"
-    "path/filepath"
+	"encoding/json"
+	"os"
 )
 
-func getConfigPath() string {
-    // Always use the same logic as SaveConfig
-    rootDir := filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(os.Args[0]))))
-    return filepath.Join(rootDir, "set.json")
-}
+const ConfigPath = "./set.json"
 
+// GetConfigValue retrieves a specific value from the config
 func GetConfigValue(key string) interface{} {
-    configPath := getConfigPath()
-    data, err := os.ReadFile(configPath)
-    if err != nil {
-        return nil
-    }
-    var arr []map[string]interface{}
-    if err := json.Unmarshal(data, &arr); err != nil || len(arr) == 0 {
-        return nil
-    }
-    return arr[0][key]
+	data, err := os.ReadFile(ConfigPath)
+	if err != nil {
+		return nil
+	}
+
+	var config map[string]interface{}
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil
+	}
+
+	return config[key]
 }
 
-func GetConfig() map[string]interface{} {
-    configPath := getConfigPath()
-    data, err := os.ReadFile(configPath)
-    if err != nil {
-        return nil
-    }
-    var config map[string]interface{}
-    if err := json.Unmarshal(data, &config); err != nil {
-        return nil
-    }
-    return config
+// GetConfig retrieves the entire configuration
+func GetConfig() (map[string]interface{}, error) {
+	data, err := os.ReadFile(ConfigPath)
+	if err != nil {
+		return nil, err
+	}
+
+	var config map[string]interface{}
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, err
+	}
+
+	return config, nil
+}
+
+// GetAPIKey retrieves the AI API key from config
+func GetAPIKey() (string, error) {
+	config, err := GetConfig()
+	if err != nil {
+		return "", err
+	}
+
+	apiKey, ok := config["AI_API"].(string)
+	if !ok || apiKey == "" {
+		return "", ErrAPIKeyNotSet
+	}
+
+	return apiKey, nil
 }

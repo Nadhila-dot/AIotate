@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"nadhi.dev/sarvar/fun/ai"
-	"nadhi.dev/sarvar/fun/config"
 	"nadhi.dev/sarvar/fun/latex"
 	logg "nadhi.dev/sarvar/fun/logs"
 	websocket "nadhi.dev/sarvar/fun/websocket"
@@ -33,25 +32,24 @@ func (sq *SheetQueue) generateWithAI(job *QueuedJob) (interface{}, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 6000000*time.Second)
 	defer cancel()
-	// apiKey := "AIzaSyDQ9qnSOVbPZVlmNKboTRFeh1I6NjpgZgU"
-	apiKey, api_error := config.GetConfigValue("AI_API").(string)
-	if !api_error {
-		sq.statusUpdates <- StatusUpdate{
-			ID:     job.ID,
-			Status: "processing",
-			Data:   websocket.Review_output("Missing API Key", "# Please set your AI_API key in the configuration to proceed.", true, map[string]interface{}{}),
-		}
-		sq.statusUpdates <- StatusUpdate{
-			ID:     job.ID,
-			Status: "processing",
-			Data:   websocket.End("We couldn't find an API key", map[string]interface{}{})["data"].(map[string]interface{}),
-		}
 
-		return nil, fmt.Errorf("AI_API not set or not a string")
+	// Validate AI configuration
+	if err := ai.ValidateAIConfig(); err != nil {
+		sq.statusUpdates <- StatusUpdate{
+			ID:     job.ID,
+			Status: "failed",
+			Data:   websocket.Review_output("AI Configuration Error", fmt.Sprintf("# AI Configuration Error\n\n%s\n\nPlease check your set.json configuration.\n\n## Gemini Setup\nSet `AI_PROVIDER` to `gemini` and add your `GEMINI_API_KEY`.\nGet a key from: https://aistudio.google.com/app/apikey\n\n## OpenRouter Setup\nSet `AI_PROVIDER` to `openrouter` and add your `OPENROUTER_API_KEY`.\nGet a key from: https://openrouter.ai/keys", err.Error()), true, map[string]interface{}{}),
+		}
+		sq.statusUpdates <- StatusUpdate{
+			ID:     job.ID,
+			Status: "failed",
+			Data:   websocket.End("AI not configured", map[string]interface{}{})["data"].(map[string]interface{}),
+		}
+		return nil, fmt.Errorf("AI configuration error: %w", err)
 	}
 
 	// 2. AI Generation
-	result, err := ai.ProcessGeminiGeneration(ctx, apiKey, job.ID, &request)
+	result, err := ai.ProcessGeneration(ctx, job.ID, &request)
 	if err != nil {
 		sq.statusUpdates <- StatusUpdate{
 			ID:     job.ID,
@@ -131,8 +129,8 @@ func (sq *SheetQueue) generateWithAI(job *QueuedJob) (interface{}, error) {
 
 	// Now convert with the cleaned content
 	if _, err := latex.ConvertLatexToPDFWithRetry(rawLatex,
-		texFilename, bucketPath, apiKey); err != nil {
-		errorDetails := fmt.Sprintf("PDF conversion failed: %v")
+		texFilename, bucketPath); err != nil {
+		errorDetails := fmt.Sprintf("PDF conversion failed: %v", err)
 
 		// Log the detailed error
 		logg.Error(errorDetails)

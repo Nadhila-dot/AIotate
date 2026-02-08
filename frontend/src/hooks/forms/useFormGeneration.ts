@@ -15,6 +15,9 @@ export interface FormData {
   visibility: string;
   curriculum: string;
   specialInstructions: string;
+  mode: string;
+  webSearchQuery?: string;
+  webSearchEnabled?: boolean;
 }
 
 export interface LoadingState {
